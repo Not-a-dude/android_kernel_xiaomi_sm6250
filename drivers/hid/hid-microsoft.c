@@ -6,6 +6,7 @@
  *  Copyright (c) 2005 Michael Haboustak <mike-@cinci.rr.com> for Concept2, Inc
  *  Copyright (c) 2006-2007 Jiri Kosina
  *  Copyright (c) 2008 Jiri Slaby
+ *  Backported Xbox One S / Series Bluetooth Rumble to Linux 4.14
  */
 
 /*
@@ -22,22 +23,85 @@
 
 #include "hid-ids.h"
 
-#define MS_HIDINPUT		0x01
-#define MS_ERGONOMY		0x02
-#define MS_PRESENTER		0x04
-#define MS_RDESC		0x08
-#define MS_NOGET		0x10
-#define MS_DUPLICATE_USAGES	0x20
+/* Backport definitions for Linux 4.14 */
+#ifndef HID_QUIRK_INPUT_PER_APP
+#define HID_QUIRK_INPUT_PER_APP 0
+#endif
+
+#ifndef HID_GD_RFKILL_BTN
+#define HID_GD_RFKILL_BTN 0x000100c6
+#endif
+
+#ifndef list_is_first
+static inline bool list_is_first(const struct list_head *list,
+				 const struct list_head *head)
+{
+	return list->prev == head;
+}
+#endif
+
+#ifndef USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708
+#define USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708		0x02e0
+#endif
+#ifndef USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708_BLE
+#define USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708_BLE		0x0b13
+#endif
+#ifndef USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1914
+#define USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1914		0x0b12
+#endif
+#ifndef USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1797
+#define USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1797		0x02fd
+#endif
+#ifndef USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1797_BLE
+#define USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1797_BLE		0x0b05
+#endif
+#ifndef USB_DEVICE_ID_8BITDO_SN30_PRO_PLUS
+#define USB_DEVICE_ID_8BITDO_SN30_PRO_PLUS			0x02e0
+#endif
+
+#define MS_HIDINPUT		BIT(0)
+#define MS_ERGONOMY		BIT(1)
+#define MS_PRESENTER		BIT(2)
+#define MS_RDESC		BIT(3)
+#define MS_NOGET		BIT(4)
+#define MS_DUPLICATE_USAGES	BIT(5)
+#define MS_SURFACE_DIAL		BIT(6)
+#define MS_QUIRK_FF		BIT(7)
+
+struct ms_data {
+	unsigned long quirks;
+	struct hid_device *hdev;
+	struct work_struct ff_worker;
+	__u8 strong;
+	__u8 weak;
+	void *output_report_dmabuf;
+};
+
+#define XB1S_FF_REPORT		3
+#define ENABLE_WEAK		BIT(0)
+#define ENABLE_STRONG		BIT(1)
+
+enum {
+	MAGNITUDE_STRONG = 2,
+	MAGNITUDE_WEAK,
+	MAGNITUDE_NUM
+};
+
+struct xb1s_ff_report {
+	__u8	report_id;
+	__u8	enable;
+	__u8	magnitude[MAGNITUDE_NUM];
+	__u8	duration_10ms;
+	__u8	start_delay_10ms;
+	__u8	loop_count;
+} __packed;
 
 static __u8 *ms_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 		unsigned int *rsize)
 {
-	unsigned long quirks = (unsigned long)hid_get_drvdata(hdev);
+	struct ms_data *ms = hid_get_drvdata(hdev);
+	unsigned long quirks = ms ? ms->quirks : 0;
 
-	/*
-	 * Microsoft Wireless Desktop Receiver (Model 1028) has
-	 * 'Usage Min/Max' where it ought to have 'Physical Min/Max'
-	 */
 	if ((quirks & MS_RDESC) && *rsize == 571 && rdesc[557] == 0x19 &&
 			rdesc[559] == 0x29) {
 		hid_info(hdev, "fixing up Microsoft Wireless Receiver Model 1028 report descriptor\n");
@@ -56,10 +120,6 @@ static int ms_ergonomy_kb_quirk(struct hid_input *hi, struct hid_usage *usage,
 
 	if ((usage->hid & HID_USAGE_PAGE) == HID_UP_CONSUMER) {
 		switch (usage->hid & HID_USAGE) {
-		/*
-		 * Microsoft uses these 2 reserved usage ids for 2 keys on
-		 * the MS office kb labelled "Office Home" and "Task Pane".
-		 */
 		case 0x29d:
 			ms_map_key_clear(KEY_PROG1);
 			return 1;
@@ -77,24 +137,14 @@ static int ms_ergonomy_kb_quirk(struct hid_input *hi, struct hid_usage *usage,
 	case 0xfd06: ms_map_key_clear(KEY_CHAT);	break;
 	case 0xfd07: ms_map_key_clear(KEY_PHONE);	break;
 	case 0xff00:
-		/* Special keypad keys */
 		ms_map_key_clear(KEY_KPEQUAL);
 		set_bit(KEY_KPLEFTPAREN, input->keybit);
 		set_bit(KEY_KPRIGHTPAREN, input->keybit);
 		break;
 	case 0xff01:
-		/* Scroll wheel */
 		hid_map_usage_clear(hi, usage, bit, max, EV_REL, REL_WHEEL);
 		break;
 	case 0xff02:
-		/*
-		 * This byte contains a copy of the modifier keys byte of a
-		 * standard hid keyboard report, as send by interface 0
-		 * (this usage is found on interface 1).
-		 *
-		 * This byte only gets send when another key in the same report
-		 * changes state, and as such is useless, ignore it.
-		 */
 		return -1;
 	case 0xff05:
 		set_bit(EV_REP, input->evbit);
@@ -130,11 +180,30 @@ static int ms_presenter_8k_quirk(struct hid_input *hi, struct hid_usage *usage,
 	return 1;
 }
 
+static int ms_surface_dial_quirk(struct hid_input *hi, struct hid_field *field,
+		struct hid_usage *usage, unsigned long **bit, int *max)
+{
+	switch (usage->hid & HID_USAGE_PAGE) {
+	case 0xff070000:
+	case HID_UP_DIGITIZER:
+		return -1;
+	case HID_UP_GENDESK:
+		switch (usage->hid) {
+		case HID_GD_X:
+		case HID_GD_Y:
+		case HID_GD_RFKILL_BTN:
+			return -1;
+		}
+	}
+	return 0;
+}
+
 static int ms_input_mapping(struct hid_device *hdev, struct hid_input *hi,
 		struct hid_field *field, struct hid_usage *usage,
 		unsigned long **bit, int *max)
 {
-	unsigned long quirks = (unsigned long)hid_get_drvdata(hdev);
+	struct ms_data *ms = hid_get_drvdata(hdev);
+	unsigned long quirks = ms ? ms->quirks : 0;
 
 	if (quirks & MS_ERGONOMY) {
 		int ret = ms_ergonomy_kb_quirk(hi, usage, bit, max);
@@ -146,6 +215,12 @@ static int ms_input_mapping(struct hid_device *hdev, struct hid_input *hi,
 			ms_presenter_8k_quirk(hi, usage, bit, max))
 		return 1;
 
+	if (quirks & MS_SURFACE_DIAL) {
+		int ret = ms_surface_dial_quirk(hi, field, usage, bit, max);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 
@@ -153,7 +228,8 @@ static int ms_input_mapped(struct hid_device *hdev, struct hid_input *hi,
 		struct hid_field *field, struct hid_usage *usage,
 		unsigned long **bit, int *max)
 {
-	unsigned long quirks = (unsigned long)hid_get_drvdata(hdev);
+	struct ms_data *ms = hid_get_drvdata(hdev);
+	unsigned long quirks = ms ? ms->quirks : 0;
 
 	if (quirks & MS_DUPLICATE_USAGES)
 		clear_bit(usage->code, *bit);
@@ -164,7 +240,8 @@ static int ms_input_mapped(struct hid_device *hdev, struct hid_input *hi,
 static int ms_event(struct hid_device *hdev, struct hid_field *field,
 		struct hid_usage *usage, __s32 value)
 {
-	unsigned long quirks = (unsigned long)hid_get_drvdata(hdev);
+	struct ms_data *ms = hid_get_drvdata(hdev);
+	unsigned long quirks = ms ? ms->quirks : 0;
 	struct input_dev *input;
 
 	if (!(hdev->claimed & HID_CLAIMED_INPUT) || !field->hidinput ||
@@ -173,9 +250,7 @@ static int ms_event(struct hid_device *hdev, struct hid_field *field,
 
 	input = field->hidinput->input;
 
-	/* Handling MS keyboards special buttons */
 	if (quirks & MS_ERGONOMY && usage->hid == (HID_UP_MSVENDOR | 0xff00)) {
-		/* Special keypad keys */
 		input_report_key(input, KEY_KPEQUAL, value & 0x01);
 		input_report_key(input, KEY_KPLEFTPAREN, value & 0x02);
 		input_report_key(input, KEY_KPRIGHTPAREN, value & 0x04);
@@ -183,16 +258,10 @@ static int ms_event(struct hid_device *hdev, struct hid_field *field,
 	}
 
 	if (quirks & MS_ERGONOMY && usage->hid == (HID_UP_MSVENDOR | 0xff01)) {
-		/* Scroll wheel */
 		int step = ((value & 0x60) >> 5) + 1;
-
 		switch (value & 0x1f) {
-		case 0x01:
-			input_report_rel(input, REL_WHEEL, step);
-			break;
-		case 0x1f:
-			input_report_rel(input, REL_WHEEL, -step);
-			break;
+		case 0x01: input_report_rel(input, REL_WHEEL, step); break;
+		case 0x1f: input_report_rel(input, REL_WHEEL, -step); break;
 		}
 		return 1;
 	}
@@ -219,32 +288,105 @@ static int ms_event(struct hid_device *hdev, struct hid_field *field,
 	return 0;
 }
 
+static void ms_ff_worker(struct work_struct *work)
+{
+	struct ms_data *ms = container_of(work, struct ms_data, ff_worker);
+	struct hid_device *hdev = ms->hdev;
+	struct xb1s_ff_report *r = ms->output_report_dmabuf;
+	int ret;
+
+	memset(r, 0, sizeof(*r));
+
+	r->report_id = XB1S_FF_REPORT;
+	r->enable = ENABLE_WEAK | ENABLE_STRONG;
+	r->duration_10ms = U8_MAX;
+	r->loop_count = U8_MAX;
+	r->magnitude[MAGNITUDE_STRONG] = ms->strong;
+	r->magnitude[MAGNITUDE_WEAK] = ms->weak;
+
+	ret = hid_hw_output_report(hdev, (__u8 *)r, sizeof(*r));
+	if (ret < 0)
+		hid_warn(hdev, "failed to send FF report\n");
+}
+
+static int ms_play_effect(struct input_dev *dev, void *data,
+			  struct ff_effect *effect)
+{
+	struct hid_device *hid = input_get_drvdata(dev);
+	struct ms_data *ms = hid_get_drvdata(hid);
+
+	if (effect->type != FF_RUMBLE)
+		return 0;
+
+	ms->strong = ((u32) effect->u.rumble.strong_magnitude * 100) / U16_MAX;
+	ms->weak = ((u32) effect->u.rumble.weak_magnitude * 100) / U16_MAX;
+
+	schedule_work(&ms->ff_worker);
+	return 0;
+}
+
+static int ms_input_configured(struct hid_device *hdev, struct hid_input *hidinput)
+{
+	struct ms_data *ms = hid_get_drvdata(hdev);
+	struct input_dev *input_dev = hidinput->input;
+
+	if (!ms || !(ms->quirks & MS_QUIRK_FF))
+		return 0;
+
+	if (!list_is_first(&hidinput->list, &hdev->inputs))
+		return 0;
+
+	ms->hdev = hdev;
+	INIT_WORK(&ms->ff_worker, ms_ff_worker);
+
+	ms->output_report_dmabuf = devm_kzalloc(&hdev->dev,
+						sizeof(struct xb1s_ff_report),
+						GFP_KERNEL);
+	if (ms->output_report_dmabuf == NULL)
+		return -ENOMEM;
+
+	input_set_capability(input_dev, EV_FF, FF_RUMBLE);
+	return input_ff_create_memless(input_dev, NULL, ms_play_effect);
+}
+
 static int ms_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	unsigned long quirks = id->driver_data;
+	struct ms_data *ms;
 	int ret;
 
-	hid_set_drvdata(hdev, (void *)quirks);
+	ms = devm_kzalloc(&hdev->dev, sizeof(*ms), GFP_KERNEL);
+	if (ms == NULL)
+		return -ENOMEM;
+
+	ms->quirks = quirks;
+	hid_set_drvdata(hdev, ms);
 
 	if (quirks & MS_NOGET)
 		hdev->quirks |= HID_QUIRK_NOGET;
 
+	if (quirks & MS_SURFACE_DIAL)
+		hdev->quirks |= HID_QUIRK_INPUT_PER_APP;
+
 	ret = hid_parse(hdev);
 	if (ret) {
 		hid_err(hdev, "parse failed\n");
-		goto err_free;
+		return ret;
 	}
 
 	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT | ((quirks & MS_HIDINPUT) ?
 				HID_CONNECT_HIDINPUT_FORCE : 0));
 	if (ret) {
 		hid_err(hdev, "hw start failed\n");
-		goto err_free;
+		return ret;
 	}
 
 	return 0;
-err_free:
-	return ret;
+}
+
+static void ms_remove(struct hid_device *hdev)
+{
+	hid_hw_stop(hdev);
 }
 
 static const struct hid_device_id ms_devices[] = {
@@ -281,6 +423,22 @@ static const struct hid_device_id ms_devices[] = {
 
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_PRESENTER_8K_BT),
 		.driver_data = MS_PRESENTER },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, 0x091B),
+		.driver_data = MS_SURFACE_DIAL },
+
+	/* Xbox One S / Series Bluetooth Controllers */
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708),
+		.driver_data = MS_QUIRK_FF },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708_BLE),
+		.driver_data = MS_QUIRK_FF },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1914),
+		.driver_data = MS_QUIRK_FF },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1797),
+		.driver_data = MS_QUIRK_FF },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1797_BLE),
+		.driver_data = MS_QUIRK_FF },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_8BITDO_SN30_PRO_PLUS),
+		.driver_data = MS_QUIRK_FF },
 	{ }
 };
 MODULE_DEVICE_TABLE(hid, ms_devices);
@@ -291,8 +449,10 @@ static struct hid_driver ms_driver = {
 	.report_fixup = ms_report_fixup,
 	.input_mapping = ms_input_mapping,
 	.input_mapped = ms_input_mapped,
+	.input_configured = ms_input_configured,
 	.event = ms_event,
 	.probe = ms_probe,
+	.remove = ms_remove,
 };
 module_hid_driver(ms_driver);
 
